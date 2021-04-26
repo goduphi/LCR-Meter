@@ -1,6 +1,5 @@
 /*
  * Sarker Nadir Afridi Azmi
- * Assumptions:
  */
 
 #include <stdint.h>
@@ -25,6 +24,7 @@
 #define DISCHARGE_TIME          1000000
 #define RESISTANCE_CONST        57.90883367
 #define CAPACITANCE_CONST       5194551.85
+#define INDUCTANCE_CONST        1.5303
 #define VSUPPLY                 3.295
 #define R33OHMS                 32.7
 
@@ -40,7 +40,7 @@ bool isCapacitanceMeasurement = false;
 bool isInductanceMeasurement = false;
 char str[50];
 
-void initHw()
+void initLcrMeter()
 {
     initSystemClockTo40Mhz();
 
@@ -102,6 +102,38 @@ void initComparator0()
     NVIC_EN0_R |= 1 << (INT_COMP0-16);
 }
 
+/*
+ * This function returns the resistance of the device under test
+ * This only works for small values of R where R < 100 Ohm's
+ */
+float readDutResistance()
+{
+    // Read the collector conversion result of Q3 (NPN Transistor)
+    setAdc0Ss3Mux(1);
+    uint16_t RQ3Vc = readAdc0Ss3();
+    // Read the collector conversion result of Q7 (PNP Transistor)
+    setAdc0Ss3Mux(2);
+    uint16_t RQ7Vc = readAdc0Ss3();
+    // Read the conversion result of DUT2
+    setAdc0Ss3Mux(3);
+    uint16_t Rdut2 = readAdc0Ss3();
+    /*
+     * Use the voltage divider rule to find small values of R
+     * R1 / R2 = V1 / V2
+     * V1 = Q7Vc - DUT2
+     * V2 = DUT2 - Q3Vc
+     * R2 = 32.7 Ohm's
+     */
+    float q3Vc = (VSUPPLY * (RQ3Vc + 0.5)) / 4096.0;
+    float q7Vc = (VSUPPLY * (RQ7Vc + 0.5)) / 4096.0;
+    float dut2 = (VSUPPLY * (Rdut2 + 0.5)) / 4096.0;
+    float dut2ResistancePd = q7Vc - dut2;
+    // Reuse dut2ResistancePd to save stack space
+    // This is the esr we are trying to calculate
+    dut2ResistancePd = (dut2ResistancePd / (dut2 - q3Vc)) * R33OHMS;
+    return dut2ResistancePd;
+}
+
 // Records the timer value after the comparator reaches 2.467V
 void comparator0Isr()
 {
@@ -138,50 +170,26 @@ void comparator0Isr()
     if(isInductanceMeasurement)
     {
         isInductanceMeasurement = false;
-        /*
-         * T = L/R
-         */
-        // chargeTime /= CAPACITANCE_CONST;
-        sprintf(str, "Inductance = %.2f uH\n", chargeTime);
+        setPinValue(LOWSIDE_R, 0);
+        setPinValue(MEAS_LR, 0);
+
+        // Measure the esr
+        setPinValue(MEAS_LR, 1);
+        setPinValue(LOWSIDE_R, 1);
+        waitMicrosecond(1000);
+        float esr = readDutResistance();
+        setPinValue(MEAS_LR, 0);
+        setPinValue(LOWSIDE_R, 0);
+
+        float inductance = ((R33OHMS / (R33OHMS + esr)) * chargeTime) / INDUCTANCE_CONST;
+        sprintf(str, "Inductance = %.2f uH\n", inductance);
         putsUart0(str);
     }
 }
 
-/*
- * This function returns the resistance of the device under test
- * This only works for small values of R where R < 100 Ohm's
- */
-float readDutResistance()
-{
-    // Read the collector conversion result of Q3 (NPN Transistor)
-    setAdc0Ss3Mux(1);
-    uint16_t RQ3Vc = readAdc0Ss3();
-    // Read the collector conversion result of Q7 (PNP Transistor)
-    setAdc0Ss3Mux(2);
-    uint16_t RQ7Vc = readAdc0Ss3();
-    // Read the conversion result of DUT2
-    setAdc0Ss3Mux(3);
-    uint16_t Rdut2 = readAdc0Ss3();
-    /*
-     * Use the voltage divider rule to find small values of R
-     * R1 / R2 = V1 / V2
-     * V1 = Q7Vc - DUT2
-     * V2 = DUT2 - Q3Vc
-     * R2 = 32.7 Ohm's
-     */
-    float q3Vc = (VSUPPLY * (RQ3Vc + 0.5)) / 4096.0;
-    float q7Vc = (VSUPPLY * (RQ7Vc + 0.5)) / 4096.0;
-    float dut2 = (VSUPPLY * (Rdut2 + 0.5)) / 4096.0;
-    float dut2ResistancePd = q7Vc - dut2;
-    // Reuse dut2ResistancePd to save stack space
-    // This is the esr we are trying to calculate
-    dut2ResistancePd = (dut2ResistancePd / (dut2 - q3Vc)) * R33OHMS;
-    return dut2ResistancePd;
-}
-
 int main(void)
 {
-    initHw();
+    initLcrMeter();
     initTimer();
     initComparator0();
     initAdc0Ss3();
@@ -201,6 +209,7 @@ int main(void)
         putsUart0("DVM> ");
         getsUart0(&data);
         parseField(&data);
+        //COMP_ACINTEN_R &= ~COMP_ACINTEN_IN0;
 
         // Measure Resistance/Inductance
         if(isCommand(&data, "mlr", 0))
@@ -242,16 +251,12 @@ int main(void)
         {
             isInductanceMeasurement = true;
             resetMeasurements();
-            // Discharge inductor under test
-            setPinValue(MEAS_C, 1);
             setPinValue(LOWSIDE_R, 1);
-            waitMicrosecond(DISCHARGE_TIME);
-            setPinValue(MEAS_C, 0);
-            COMP_ACINTEN_R |= COMP_ACINTEN_IN0;
             // Reset timer value and enable interrupts
             TIMER0_TAV_R = 0;
-            setPinValue(MEAS_LR, 1);
+            COMP_ACINTEN_R |= COMP_ACINTEN_IN0;
             TIMER0_CTL_R |= TIMER_CTL_TAEN;
+            setPinValue(MEAS_LR, 1);
         }
 
         if(isCommand(&data, "v", 0))
