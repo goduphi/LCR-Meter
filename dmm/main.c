@@ -33,12 +33,16 @@
 #define AIN2                    PORTE,1
 #define AIN1                    PORTE,2
 
+#define ABS(N) (((N)<0)?(-N):(N))
+
 // Get the count after compare value in C0 is reached
 float chargeTime = 0;
 bool isResistanceMeasurement = false;
 bool isCapacitanceMeasurement = false;
 bool isInductanceMeasurement = false;
-char str[50];
+float startingVoltage = 0;
+float endingVoltage = 0;
+char str[100];
 
 void initLcrMeter()
 {
@@ -102,6 +106,15 @@ void initComparator0()
     NVIC_EN0_R |= 1 << (INT_COMP0-16);
 }
 
+float getDut2Voltage()
+{
+    // Read the conversion result of DUT2
+    setAdc0Ss3Mux(3);
+    uint16_t Rdut2 = readAdc0Ss3();
+    float dut2 = (VSUPPLY * (Rdut2 + 0.5)) / 4096.0;
+    return dut2;
+}
+
 /*
  * This function returns the resistance of the device under test
  * This only works for small values of R where R < 100 Ohm's
@@ -132,6 +145,19 @@ float readDutResistance()
     // This is the esr we are trying to calculate
     dut2ResistancePd = (dut2ResistancePd / (dut2 - q3Vc)) * R33OHMS;
     return dut2ResistancePd;
+}
+
+float measureEsr()
+{
+    float esr = 0.00;
+    // Measure the esr
+    setPinValue(MEAS_LR, 1);
+    setPinValue(LOWSIDE_R, 1);
+    waitMicrosecond(1000);
+    esr = readDutResistance();
+    setPinValue(MEAS_LR, 0);
+    setPinValue(LOWSIDE_R, 0);
+    return esr;
 }
 
 // Records the timer value after the comparator reaches 2.467V
@@ -172,20 +198,67 @@ void comparator0Isr()
         isInductanceMeasurement = false;
         setPinValue(LOWSIDE_R, 0);
         setPinValue(MEAS_LR, 0);
-
-        // Measure the esr
-        setPinValue(MEAS_LR, 1);
-        setPinValue(LOWSIDE_R, 1);
-        waitMicrosecond(1000);
-        float esr = readDutResistance();
-        setPinValue(MEAS_LR, 0);
-        setPinValue(LOWSIDE_R, 0);
-
+        float esr = measureEsr();
         float inductance = ((R33OHMS / (R33OHMS + esr)) * chargeTime) / INDUCTANCE_CONST;
         sprintf(str, "Inductance = %.2f uH\n", inductance);
         putsUart0(str);
     }
 }
+
+void measureResistance()
+{
+    isResistanceMeasurement = true;
+    resetMeasurements();
+    // Discharge the 1uF capacitor
+    setPinValue(INTEGRATE, 1);
+    setPinValue(LOWSIDE_R, 1);
+    waitMicrosecond(DISCHARGE_TIME);
+    COMP_ACINTEN_R |= COMP_ACINTEN_IN0;
+    // Turn of low side r
+    setPinValue(LOWSIDE_R, 0);
+    // Reset timer value and enable interrupts
+    TIMER0_TAV_R = 0;
+    setPinValue(MEAS_LR, 1);
+    TIMER0_CTL_R |= TIMER_CTL_TAEN;
+}
+
+void measureCapacitance()
+{
+    isCapacitanceMeasurement = true;
+    resetMeasurements();
+    // Discharge capacitor under test
+    setPinValue(MEAS_C, 1);
+    setPinValue(LOWSIDE_R, 1);
+    waitMicrosecond(DISCHARGE_TIME);
+    setPinValue(LOWSIDE_R, 0);
+    COMP_ACINTEN_R |= COMP_ACINTEN_IN0;
+    // Reset timer value and enable interrupts
+    TIMER0_TAV_R = 0;
+    setPinValue(HIGHSIDE_R, 1);
+    TIMER0_CTL_R |= TIMER_CTL_TAEN;
+}
+
+void measureInductance()
+{
+    isInductanceMeasurement = true;
+    resetMeasurements();
+    setPinValue(LOWSIDE_R, 1);
+    // Reset timer value and enable interrupts
+    TIMER0_TAV_R = 0;
+    COMP_ACINTEN_R |= COMP_ACINTEN_IN0;
+    TIMER0_CTL_R |= TIMER_CTL_TAEN;
+    setPinValue(MEAS_LR, 1);
+}
+
+float tAbs(float a, float b)
+{
+    float res = a - b;
+    if(res < 0)
+        res = -res;
+    return res;
+}
+
+#define DEBUG
 
 int main(void)
 {
@@ -201,6 +274,8 @@ int main(void)
     initUart0();
     setUart0BaudRate(115200, 40e6);
 
+    bool r = false, c = false, l = false;
+
     USER_DATA data;
 
     // Endless loop
@@ -211,52 +286,81 @@ int main(void)
         parseField(&data);
         //COMP_ACINTEN_R &= ~COMP_ACINTEN_IN0;
 
+        if(isCommand(&data, "auto", 0))
+        {
+            r = l = false;
+            setPinValue(LOWSIDE_R, 1);
+            setPinValue(MEAS_LR, 1);
+            startingVoltage = getDut2Voltage();
+            waitMicrosecond(100000);
+            endingVoltage = getDut2Voltage();
+            setPinValue(MEAS_LR, 0);
+            setPinValue(MEAS_C, 1);
+            waitMicrosecond(DISCHARGE_TIME);
+            setPinValue(LOWSIDE_R, 0);
+            setPinValue(MEAS_C, 0);
+
+            resetMeasurements();
+
+            if((tAbs(endingVoltage, startingVoltage) < 0.03))
+            {
+                putsUart0("Might be resistance\n");
+                r = true;
+                l = false;
+            }
+
+#ifdef DEBUG
+            sprintf(str, "starting voltage = %f, ending voltage = %f, abs = %f\n", startingVoltage, endingVoltage, tAbs(endingVoltage, startingVoltage));
+            putsUart0(str);
+#endif
+
+            setPinValue(LOWSIDE_R, 1);
+            setPinValue(MEAS_LR, 1);
+            startingVoltage = getDut2Voltage();
+            endingVoltage = getDut2Voltage();
+            setPinValue(MEAS_LR, 0);
+            setPinValue(MEAS_C, 1);
+            waitMicrosecond(DISCHARGE_TIME);
+            setPinValue(LOWSIDE_R, 0);
+            setPinValue(MEAS_C, 0);
+
+            resetMeasurements();
+
+            if(endingVoltage > startingVoltage)
+            {
+                if(!r)
+                {
+                    putsUart0("This is inductance\n");
+                    l = true;
+                }
+            }
+
+            if(r && !l)
+                measureResistance();
+            if(!r && l)
+                measureInductance();
+            if(!r && !l)
+                measureCapacitance();
+
+
+        }
+
         // Measure Resistance/Inductance
         if(isCommand(&data, "mlr", 0))
         {
-            isResistanceMeasurement = true;
-            resetMeasurements();
-            // Discharge the 1uF capacitor
-            setPinValue(INTEGRATE, 1);
-            setPinValue(LOWSIDE_R, 1);
-            waitMicrosecond(DISCHARGE_TIME);
-            COMP_ACINTEN_R |= COMP_ACINTEN_IN0;
-            // Turn of low side r
-            setPinValue(LOWSIDE_R, 0);
-            // Reset timer value and enable interrupts
-            TIMER0_TAV_R = 0;
-            setPinValue(MEAS_LR, 1);
-            TIMER0_CTL_R |= TIMER_CTL_TAEN;
+            measureResistance();
         }
 
         // Measure Capacitance
         if(isCommand(&data, "mc", 0))
         {
-            isCapacitanceMeasurement = true;
-            resetMeasurements();
-            // Discharge capacitor under test
-            setPinValue(MEAS_C, 1);
-            setPinValue(LOWSIDE_R, 1);
-            waitMicrosecond(DISCHARGE_TIME);
-            setPinValue(LOWSIDE_R, 0);
-            COMP_ACINTEN_R |= COMP_ACINTEN_IN0;
-            // Reset timer value and enable interrupts
-            TIMER0_TAV_R = 0;
-            setPinValue(HIGHSIDE_R, 1);
-            TIMER0_CTL_R |= TIMER_CTL_TAEN;
+            measureCapacitance();
         }
 
         // Measure Resistance/Inductance
         if(isCommand(&data, "mi", 0))
         {
-            isInductanceMeasurement = true;
-            resetMeasurements();
-            setPinValue(LOWSIDE_R, 1);
-            // Reset timer value and enable interrupts
-            TIMER0_TAV_R = 0;
-            COMP_ACINTEN_R |= COMP_ACINTEN_IN0;
-            TIMER0_CTL_R |= TIMER_CTL_TAEN;
-            setPinValue(MEAS_LR, 1);
+            measureInductance();
         }
 
         if(isCommand(&data, "v", 0))
@@ -271,42 +375,5 @@ int main(void)
             setPinValue(MEAS_LR, 0);
             setPinValue(LOWSIDE_R, 0);
         }
-        /*
-        // Integrate
-        if(isCommand(&data, "int", 1))
-        {
-            // ~0.1 - 0.2V
-            // This part of the circuit discharges the capacitor
-            if(stringCompare("low", getFieldString(&data, 1)))
-            {
-                setPinValue(INTEGRATE, 1);
-                setPinValue(LOWSIDE_R, 1);
-                setPinValue(HIGHSIDE_R, 0);
-            }
-            // This part of the circuit charges the capacitor
-            else if(stringCompare("int", getFieldString(&data, 1)))
-            {
-                setPinValue(INTEGRATE, 1);
-                setPinValue(LOWSIDE_R, 0);
-                setPinValue(HIGHSIDE_R, 1);
-            }
-        }
-        // 3.0 - 3.15
-        // Highside
-        if(isCommand(&data, "hsr", 0))
-        {
-            setPinValue(INTEGRATE, 0);
-            setPinValue(LOWSIDE_R, 0);
-            setPinValue(HIGHSIDE_R, 1);
-        }
-        // 0.1 - 0.2
-        // Lowside
-        if(isCommand(&data, "lsr", 0))
-        {
-            setPinValue(INTEGRATE, 0);
-            setPinValue(LOWSIDE_R, 1);
-            setPinValue(HIGHSIDE_R, 0);
-        }
-        */
     }
 }
