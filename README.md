@@ -1,7 +1,6 @@
 # LCR Meter
 
-The aim of this project was to build a budget LCR meter which can measure Resistance, Capacitance, and Inductance with a reasonable amount of
-accuracy.
+The aim of this project was to build a budget LCR meter which can measure Resistance, Capacitance, and Inductance with an overall accuracy of 95.6%.
 
 Note: Please ignore the uta_iot_network and nRF24L01 directories as these were a push issue on my end. They are part of a different repository.
 
