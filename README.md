@@ -3,7 +3,7 @@
 The aim of this project was to build a budget LCR meter which can measure Resistance, Capacitance, and Inductance with a reasonable amount of
 accuracy.
 
-Note: Please ignore the MQTT client and nRF24L01 folders as these were a push issue on my end. They are part of a different repository.
+Note: Please ignore the uta_iot_network and nRF24L01 directories as these were a push issue on my end. They are part of a different repository.
 
 ## Technologies used
 - Tiva C Series (TM4C123GH6PM)
